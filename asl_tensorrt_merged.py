@@ -744,4 +744,131 @@ class ASLLetterRecognizer:
                             color = (255, 0, 255) if self.motion_trajectory.finger_type == "pinky" else (0, 255, 255)
                             for i in range(1, len(finger_points)):
                                 x1, y1 = int(finger_points[i-1][0] * w), int(finger_points[i-1][1] * h)
-                                x2
+                                x2, y2 = int(finger_points[i][0] * w), int(finger_points[i][1] * h)
+                                cv2.line(image, (x1, y1), (x2, y2), color, 4)
+                else:
+                    self.prediction_history.clear()
+                    self.stable_letter_count = 0
+                    self.consecutive_movements = 0
+                    if not self.motion_detection_active:
+                        self.motion_trajectory.clear()
+                
+                # Draw UI
+                cv2.putText(image, "TensorRT Jetson", (20, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 200, 255), 2)
+                
+                # Prediction display
+                if current_letter:
+                    pred_box_h = 150
+                    cv2.rectangle(image, (w//2 - 100, 20), (w//2 + 100, 20 + pred_box_h), (0, 0, 0), -1)
+                    cv2.rectangle(image, (w//2 - 100, 20), (w//2 + 100, 20 + pred_box_h), (0, 255, 0), 3)
+                    cv2.putText(image, current_letter, (w//2 - 50, 110),
+                               cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 255, 0), 5)
+                    cv2.putText(image, f"{confidence:.0%}", (w//2 - 40, 155),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                
+                # Motion indicator
+                if self.motion_detection_active:
+                    cv2.circle(image, (w - 40, 40), 20, (0, 165, 255), -1)
+                    cv2.putText(image, "TRACKING", (w - 160, 50),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                    traj_len = len(self.motion_trajectory.points)
+                    cv2.putText(image, f"Points: {traj_len}", (w - 160, 75),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # Word display
+                word_box_y = h - 120
+                cv2.rectangle(image, (10, word_box_y), (w - 10, h - 10), (0, 0, 0), -1)
+                cv2.rectangle(image, (10, word_box_y), (w - 10, h - 10), (255, 255, 255), 2)
+                cv2.putText(image, "WORD:", (20, word_box_y + 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                word_display = self.detected_word if self.detected_word else "(empty)"
+                cv2.putText(image, word_display, (20, word_box_y + 70),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                
+                # TTS indicator
+                tts_status = "TTS:ON" if self.tts.enabled else "TTS:OFF"
+                tts_color = (0, 255, 0) if self.tts.enabled else (128, 128, 128)
+                cv2.putText(image, tts_status, (w - 120, h - 130),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, tts_color, 2)
+                
+                # Controls
+                cv2.putText(image, "SPACE:Add | BKSP:Del | C:Clear | ENTER:Speak | T:TTS | Q:Quit",
+                           (20, h - 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                cv2.imshow('ASL Letter Recognition (TensorRT)', image)
+                
+                key = cv2.waitKey(1) & 0xFF
+                
+                if key == ord('q'):
+                    break
+                elif key == ord(' '):
+                    if current_letter and confidence > 0.75:
+                        self.add_letter_to_word(current_letter)
+                elif key == 8:  # Backspace
+                    if self.detected_word:
+                        self.detected_word = self.detected_word[:-1]
+                        print(f"Removed letter | Word: '{self.detected_word}'")
+                elif key == ord('c'):
+                    self.detected_word = ""
+                    self.last_letter = None
+                    print("Cleared word")
+                elif key == 13:  # Enter
+                    if self.detected_word:
+                        print(f"Speaking: {self.detected_word}")
+                        self.tts.speak(self.detected_word)
+                        if not self.detected_word.endswith(" "):
+                            self.detected_word += " "
+                elif key == ord('t'):
+                    enabled = self.tts.toggle()
+                    status = "enabled" if enabled else "disabled"
+                    print(f"TTS {status}")
+        
+        cap.release()
+        cv2.destroyAllWindows()
+        self.tts.close()
+        
+        if self.detected_word:
+            print(f"\n✓ Final word: {self.detected_word}")
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='ASL Letter Recognition - TensorRT-ONNX (Jetson Optimized)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python asl_recognize.py                           # Default settings
+  python asl_recognize.py --camera 1                # Use camera 1
+  python asl_recognize.py --voice path/to/voice.onnx # Enable TTS
+        """
+    )
+    parser.add_argument(
+        '--model-dir',
+        type=str,
+        default='asl_data',
+        help='Directory containing ONNX model and metadata (default: asl_data)'
+    )
+    parser.add_argument(
+        '--camera',
+        type=int,
+        default=0,
+        help='Camera device ID (default: 0)'
+    )
+    parser.add_argument(
+        '--voice',
+        type=str,
+        default=None,
+        help='Path to Piper voice model (.onnx file)'
+    )
+    
+    args = parser.parse_args()
+    
+    recognizer = ASLLetterRecognizer(args.model_dir, args.voice)
+    recognizer.run_recognition(args.camera)
+
+
+if __name__ == '__main__':
+    main()
