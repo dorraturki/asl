@@ -1,14 +1,14 @@
 """
-ASL Fingerspelling Letter Recognition - TensorRT ONNX (Jetson Optimized)
-- TensorRT-ONNX for 24 static letters (A-I, K-Y) - optimized for Jetson
+ASL Fingerspelling Letter Recognition - Simplified Version
+- Direct ONNX Runtime for 24 static letters (A-I, K-Y)
 - Rule-based trajectory detection for motion letters J and Z
+- No TensorRT dependency required
 """
 
 from typing import Optional, Tuple
-import os
 import cv2
 import numpy as np
-import pickle
+import json
 from pathlib import Path
 from collections import deque, Counter
 import time
@@ -29,18 +29,15 @@ try:
     mp_drawing_styles = mp.solutions.drawing_styles
 except AttributeError:
     print("❌ MediaPipe 'solutions' module not found")
-    print("Fix: pip uninstall mediapipe -y && pip install mediapipe==0.10.9")
     exit(1)
 
-# TensorRT + PyCUDA import (Jetson optimized)
+# ONNX Runtime import (simpler alternative to TensorRT)
 try:
-    import tensorrt as trt
-    import pycuda.driver as cuda
-    import pycuda.autoinit  # noqa: F401  (initializes CUDA context)
-    TRT_AVAILABLE = True
+    import onnxruntime as ort
+    ONNX_AVAILABLE = True
 except ImportError:
-    TRT_AVAILABLE = False
-    print("❌ TensorRT or PyCUDA not installed. Install TensorRT SDK and pycuda.")
+    ONNX_AVAILABLE = False
+    print("❌ ONNX Runtime not installed. Run: pip install onnxruntime")
     exit(1)
 
 
@@ -128,119 +125,15 @@ class MotionTrajectory:
         }
 
 
-class TensorRTONNXRuntime:
-    """Simple TensorRT runtime wrapper for an ONNX MLP model."""
-
-    def __init__(self, onnx_path: Path, max_workspace_size: int = 1 << 28):
-        self.onnx_path = onnx_path
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        self.engine = self._build_engine(max_workspace_size)
-        if self.engine is None:
-            raise RuntimeError("Failed to build TensorRT engine")
-
-        self.context = self.engine.create_execution_context()
-        self.stream = cuda.Stream()
-        self.bindings = []
-        self.inputs = []
-        self.outputs = []
-        self._allocate_buffers()
-
-    def _build_engine(self, max_workspace_size: int):
-        if not self.onnx_path.exists():
-            print(f"⚠️ ONNX model not found: {self.onnx_path}")
-            return None
-
-        print(f"✓ Loading ONNX model for TensorRT: {self.onnx_path}")
-
-        explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        with trt.Builder(self.logger) as builder, \
-             builder.create_network(explicit_batch) as network, \
-             trt.OnnxParser(network, self.logger) as parser:
-
-            with open(self.onnx_path, 'rb') as f:
-                if not parser.parse(f.read()):
-                    print("❌ Failed to parse ONNX file:")
-                    for i in range(parser.num_errors):
-                        print(parser.get_error(i))
-                    return None
-
-            config = builder.create_builder_config()
-            config.max_workspace_size = max_workspace_size
-
-            engine = builder.build_engine(network, config)
-            if engine is None:
-                print("❌ Failed to build TensorRT engine from ONNX")
-            return engine
-
-    def _allocate_buffers(self):
-        """Allocate host and device buffers for all bindings."""
-        for binding in self.engine:
-            idx = self.engine.get_binding_index(binding)
-            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
-            shape = self.engine.get_binding_shape(binding)
-
-            size = int(trt.volume(shape))
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            device_mem = cuda.mem_alloc(host_mem.nbytes)
-            self.bindings.append(int(device_mem))
-
-            io_desc = {
-                'name': binding,
-                'index': idx,
-                'host': host_mem,
-                'device': device_mem,
-                'shape': shape,
-            }
-
-            if self.engine.binding_is_input(binding):
-                self.inputs.append(io_desc)
-            else:
-                self.outputs.append(io_desc)
-
-        if len(self.inputs) != 1 or len(self.outputs) != 1:
-            print("⚠️ Expected 1 input and 1 output for MLP ONNX model.")
-
-    def infer(self, input_array: np.ndarray) -> np.ndarray:
-        """Run inference for a single batch of features.
-
-        Expects input_array with shape (1, n_features) and dtype float32.
-        Returns output as NumPy array with original engine output shape.
-        """
-        if not self.inputs or not self.outputs:
-            raise RuntimeError("TensorRT buffers not properly initialized")
-
-        inp = self.inputs[0]
-        flat_input = input_array.astype(inp['host'].dtype).ravel()
-        if flat_input.size != inp['host'].size:
-            raise ValueError(
-                f"Input size mismatch for TensorRT engine: "
-                f"expected {inp['host'].size}, got {flat_input.size}"
-            )
-
-        np.copyto(inp['host'], flat_input)
-
-        # Transfer to device and execute
-        cuda.memcpy_htod_async(inp['device'], inp['host'], self.stream)
-        self.context.execute_v2(self.bindings)
-
-        # Copy outputs back
-        out = self.outputs[0]
-        cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
-        self.stream.synchronize()
-
-        return np.array(out['host']).reshape(out['shape'])
-
-
 class ASLLetterRecognizer:
-    """Real-time ASL recognition with TensorRT-ONNX + Rule-based Motion"""
+    """Real-time ASL recognition with ONNX Runtime + Rule-based Motion"""
     
     def __init__(self, model_dir: str = "asl_data"):
         self.model_dir = Path(model_dir)
 
-        # Load TensorRT engine from ONNX model
-        onnx_model_name = "asl_static_model.onnx"
-        self.trt_runtime = self._load_trt_engine(onnx_model_name)
-        self.static_metadata = self._load_metadata("asl_static_metadata.pkl")
+        # Load ONNX model and metadata
+        self.onnx_session = self._load_onnx_model("asl_static_model.onnx")
+        self.metadata = self._load_metadata_json("asl_static_metadata.json")
         
         # Store MediaPipe modules
         self.mp_hands = mp_hands
@@ -288,35 +181,60 @@ class ASLLetterRecognizer:
         self.last_motion_confidence = 0.0
         self.motion_hold_time = 1.0
 
-        if self.trt_runtime is not None:
-            print("✓ Loaded TensorRT-ONNX model (Jetson optimized)")
+        if self.onnx_session is not None:
+            print("✓ Loaded ONNX model (static letters)")
         print("✓ Using rule-based motion detection for J/Z")
 
-    def _load_trt_engine(self, filename: str) -> Optional[TensorRTONNXRuntime]:
-        """Load TensorRT engine from ONNX file in model_dir."""
-        filepath = self.model_dir / filename
-
-        try:
-            runtime = TensorRTONNXRuntime(filepath)
-            return runtime
-        except Exception as e:
-            print(f"❌ Error loading TensorRT-ONNX model: {e}")
-            return None
-    
-    def _load_metadata(self, filename: str):
-        """Load metadata pickle file"""
+    def _load_onnx_model(self, filename: str):
+        """Load ONNX model with ONNX Runtime"""
         filepath = self.model_dir / filename
         
         if not filepath.exists():
-            print(f"⚠️ Metadata not found: {filepath}")
+            print(f"⚠️ ONNX model not found: {filepath}")
+            print("   Static letter recognition will not work.")
             return None
         
         try:
-            with open(filepath, 'rb') as f:
-                return pickle.load(f)
+            session = ort.InferenceSession(str(filepath))
+            print(f"✓ Loaded ONNX model: {filepath}")
+            return session
         except Exception as e:
-            print(f"❌ Error loading metadata: {e}")
+            print(f"❌ Error loading ONNX model: {e}")
             return None
+    
+    def _load_metadata_json(self, filename: str):
+        """Load metadata from JSON file (instead of pickle)"""
+        filepath = self.model_dir / filename
+        
+        if not filepath.exists():
+            print(f"⚠️ Metadata JSON not found: {filepath}")
+            print("   Will use default label mapping (A-Y excluding J)")
+            # Create default metadata
+            labels = [chr(i) for i in range(65, 91) if chr(i) not in ['J', 'Z']]
+            return {
+                'labels': labels,
+                'normalization_params': {
+                    'mean': [0.0] * 42,
+                    'std': [1.0] * 42
+                }
+            }
+        
+        try:
+            with open(filepath, 'r') as f:
+                metadata = json.load(f)
+            print(f"✓ Loaded metadata: {filepath}")
+            return metadata
+        except Exception as e:
+            print(f"⚠️ Error loading metadata: {e}")
+            print("   Using default label mapping")
+            labels = [chr(i) for i in range(65, 91) if chr(i) not in ['J', 'Z']]
+            return {
+                'labels': labels,
+                'normalization_params': {
+                    'mean': [0.0] * 42,
+                    'std': [1.0] * 42
+                }
+            }
     
     def extract_static_features(self, hand_landmarks) -> Optional[np.ndarray]:
         """Extract 42 features from hand landmarks"""
@@ -336,18 +254,18 @@ class ASLLetterRecognizer:
             landmarks[::2] -= wrist_x
             landmarks[1::2] -= wrist_y
             
-            # Scale by hand size
+            # Scale by hand size (wrist to middle finger tip)
             hand_size = np.sqrt(
-                (landmarks[18*2] - landmarks[0])**2 + 
-                (landmarks[18*2+1] - landmarks[1])**2
+                (landmarks[24] - landmarks[0])**2 + 
+                (landmarks[25] - landmarks[1])**2
             ) + 1e-6
             landmarks /= hand_size
             
-            # Apply training normalization
-            if self.static_metadata and 'normalization_params' in self.static_metadata:
-                norm_params = self.static_metadata['normalization_params']
-                mean = np.asarray(norm_params['mean'], dtype=np.float32)
-                std = np.asarray(norm_params['std'], dtype=np.float32)
+            # Apply normalization if available
+            if self.metadata and 'normalization_params' in self.metadata:
+                norm_params = self.metadata['normalization_params']
+                mean = np.array(norm_params['mean'], dtype=np.float32)
+                std = np.array(norm_params['std'], dtype=np.float32)
                 landmarks = (landmarks - mean) / (std + 1e-6)
             
             return landmarks
@@ -492,10 +410,6 @@ class ASLLetterRecognizer:
                         
                         self.prev_hand_landmarks = hand_landmarks
                         return letter, confidence
-                    else:
-                        print(f"❌ Motion uncertain (conf={confidence:.0%})")
-                else:
-                    print(f"❌ Motion too small (dist={total_distance:.3f})")
                 
                 self.motion_detection_active = False
                 self.motion_trajectory.clear()
@@ -515,23 +429,30 @@ class ASLLetterRecognizer:
                 index_x, index_y = self.get_finger_tip_position(hand_landmarks, 'index')
                 self.motion_trajectory.add_point(wrist.x, wrist.y, index_x, index_y, "index")
         
-        # Static letter recognition with TensorRT-ONNX
-        if self.trt_runtime is not None and not self.motion_detection_active:
+        # Static letter recognition with ONNX Runtime
+        if self.onnx_session is not None and not self.motion_detection_active:
             static_features = self.extract_static_features(hand_landmarks)
             
             if static_features is not None:
                 try:
-                    # Predict with TensorRT-ONNX
+                    # Prepare input
+                    input_name = self.onnx_session.get_inputs()[0].name
                     features = static_features.reshape(1, -1).astype(np.float32)
-                    prediction = self.trt_runtime.infer(features)[0]
+                    
+                    # Run inference
+                    outputs = self.onnx_session.run(None, {input_name: features})
+                    prediction = outputs[0][0]
                     
                     pred_class = np.argmax(prediction)
                     confidence = float(prediction[pred_class])
                     
-                    # Get letter from label encoder
-                    if self.static_metadata and 'label_encoder' in self.static_metadata:
-                        label_encoder = self.static_metadata['label_encoder']
-                        letter = label_encoder.classes_[pred_class]
+                    # Get letter from metadata
+                    if self.metadata and 'labels' in self.metadata:
+                        labels = self.metadata['labels']
+                        if pred_class < len(labels):
+                            letter = labels[pred_class]
+                        else:
+                            letter = chr(65 + pred_class)
                     else:
                         letter = chr(65 + pred_class)
                     
@@ -566,10 +487,10 @@ class ASLLetterRecognizer:
             return
         
         print("\n" + "="*70)
-        print("ASL LETTER RECOGNITION - TensorRT ONNX (JETSON OPTIMIZED)")
+        print("ASL LETTER RECOGNITION - ONNX Runtime (Simplified)")
         print("="*70)
         print("\nRecognizes all 26 letters!")
-        print(" • 24 static letters: TensorRT-ONNX MLP (Jetson optimized)")
+        print(" • 24 static letters: ONNX Runtime")
         print(" • J (pinky) & Z (index): Rule-based trajectory detection")
         print("\nControls:")
         print(" SPACE: Add current letter")
@@ -631,7 +552,7 @@ class ASLLetterRecognizer:
                         self.motion_trajectory.clear()
                 
                 # Draw UI
-                cv2.putText(image, "TensorRT Jetson", (20, 30),
+                cv2.putText(image, "ONNX Runtime", (20, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 200, 255), 2)
                 
                 # Prediction display
@@ -667,7 +588,7 @@ class ASLLetterRecognizer:
                 cv2.putText(image, "SPACE:Add | BKSP:Del | C:Clear | Q:Quit",
                            (20, h - 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
-                cv2.imshow('ASL Letter Recognition (TensorRT)', image)
+                cv2.imshow('ASL Letter Recognition', image)
                 
                 key = cv2.waitKey(1) & 0xFF
                 
@@ -696,7 +617,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='ASL Letter Recognition - TensorRT-ONNX (Jetson Optimized)',
+        description='ASL Letter Recognition - ONNX Runtime (Simplified)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -708,7 +629,7 @@ Examples:
         '--model-dir',
         type=str,
         default='asl_data',
-        help='Directory containing ONNX model and metadata (default: asl_data)'
+        help='Directory containing ONNX model and metadata JSON (default: asl_data)'
     )
     parser.add_argument(
         '--camera',
