@@ -2,7 +2,6 @@
 ASL Fingerspelling Letter Recognition - TensorRT ONNX (Jetson Optimized)
 - TensorRT-ONNX for 24 static letters (A-I, K-Y) - optimized for Jetson
 - Rule-based trajectory detection for motion letters J and Z
-- Text-to-Speech support with Piper
 """
 
 from typing import Optional, Tuple
@@ -13,9 +12,6 @@ import pickle
 from pathlib import Path
 from collections import deque, Counter
 import time
-import io
-import wave
-import threading
 
 # MediaPipe import with error handling
 try:
@@ -46,120 +42,6 @@ except ImportError:
     TRT_AVAILABLE = False
     print("❌ TensorRT or PyCUDA not installed. Install TensorRT SDK and pycuda.")
     exit(1)
-
-# Optional TTS support
-try:
-    from piper import PiperVoice
-    from piper.voice import SynthesisConfig
-    import pyaudio
-    PIPER_AVAILABLE = True
-except ImportError:
-    PIPER_AVAILABLE = False
-    print("⚠ Piper TTS not available. Install with: pip install piper-tts pyaudio")
-
-
-class AudioPlayer:
-    """Simple audio player for Piper TTS output"""
-
-    def __init__(self):
-        if PIPER_AVAILABLE:
-            self.audio = pyaudio.PyAudio()
-            self.stream = None
-
-    def play_wav_data(self, wav_data):
-        """Play WAV data from memory"""
-        if not PIPER_AVAILABLE:
-            return
-
-        try:
-            wav_io = io.BytesIO(wav_data)
-            with wave.open(wav_io, 'rb') as wf:
-                if self.stream:
-                    self.stream.close()
-
-                self.stream = self.audio.open(
-                    format=self.audio.get_format_from_width(wf.getsampwidth()),
-                    channels=wf.getnchannels(),
-                    rate=wf.getframerate(),
-                    output=True
-                )
-
-                data = wf.readframes(1024)
-                while data:
-                    self.stream.write(data)
-                    data = wf.readframes(1024)
-        except Exception as e:
-            print(f"Audio playback error: {e}")
-
-    def close(self):
-        """Clean up audio resources"""
-        if PIPER_AVAILABLE:
-            if self.stream:
-                self.stream.close()
-            self.audio.terminate()
-
-
-class TTSEngine:
-    """Text-to-Speech engine using Piper"""
-
-    def __init__(self, voice_path: str = None):
-        self.voice = None
-        self.audio_player = AudioPlayer()
-        self.speaking = False
-        self.enabled = True
-
-        if not PIPER_AVAILABLE:
-            print("❌ Piper TTS not available")
-            self.enabled = False
-            return
-
-        if voice_path and Path(voice_path).exists():
-            try:
-                print(f"Loading voice: {voice_path}")
-                self.voice = PiperVoice.load(voice_path)
-                print("✓ Voice loaded successfully")
-            except Exception as e:
-                print(f"❌ Failed to load voice: {e}")
-                self.enabled = False
-        else:
-            print("⚠ No voice model provided. TTS disabled.")
-            print("Download a voice with: python -m piper.download_voices en_US-lessac-medium")
-            self.enabled = False
-
-    def speak(self, text: str, async_mode: bool = True):
-        """Speak text using Piper TTS"""
-        if not self.enabled or not self.voice or not text:
-            return
-
-        if async_mode:
-            thread = threading.Thread(target=self._speak_sync, args=(text,))
-            thread.daemon = True
-            thread.start()
-        else:
-            self._speak_sync(text)
-
-    def _speak_sync(self, text: str):
-        """Synchronous speech synthesis"""
-        try:
-            self.speaking = True
-            wav_io = io.BytesIO()
-            with wave.open(wav_io, 'wb') as wav_file:
-                self.voice.synthesize_wav(text, wav_file)
-            wav_data = wav_io.getvalue()
-            self.audio_player.play_wav_data(wav_data)
-        except Exception as e:
-            print(f"TTS error: {e}")
-        finally:
-            self.speaking = False
-
-    def toggle(self):
-        """Toggle TTS on/off"""
-        self.enabled = not self.enabled
-        return self.enabled
-
-    def close(self):
-        """Clean up resources"""
-        self.audio_player.close()
 
 
 class MotionTrajectory:
@@ -352,11 +234,8 @@ class TensorRTONNXRuntime:
 class ASLLetterRecognizer:
     """Real-time ASL recognition with TensorRT-ONNX + Rule-based Motion"""
     
-    def __init__(self, model_dir: str = "asl_data", voice_path: str = None):
+    def __init__(self, model_dir: str = "asl_data"):
         self.model_dir = Path(model_dir)
-
-        # Initialize TTS
-        self.tts = TTSEngine(voice_path)
 
         # Load TensorRT engine from ONNX model
         onnx_model_name = "asl_static_model.onnx"
@@ -696,8 +575,6 @@ class ASLLetterRecognizer:
         print(" SPACE: Add current letter")
         print(" BACKSPACE: Delete last letter")
         print(" C: Clear word")
-        print(" ENTER: Speak word")
-        print(" T: Toggle TTS")
         print(" Q: Quit")
         print("\n" + "="*70 + "\n")
         
@@ -786,14 +663,8 @@ class ASLLetterRecognizer:
                 cv2.putText(image, word_display, (20, word_box_y + 70),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
                 
-                # TTS indicator
-                tts_status = "TTS:ON" if self.tts.enabled else "TTS:OFF"
-                tts_color = (0, 255, 0) if self.tts.enabled else (128, 128, 128)
-                cv2.putText(image, tts_status, (w - 120, h - 130),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, tts_color, 2)
-                
                 # Controls
-                cv2.putText(image, "SPACE:Add | BKSP:Del | C:Clear | ENTER:Speak | T:TTS | Q:Quit",
+                cv2.putText(image, "SPACE:Add | BKSP:Del | C:Clear | Q:Quit",
                            (20, h - 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
                 cv2.imshow('ASL Letter Recognition (TensorRT)', image)
@@ -813,20 +684,9 @@ class ASLLetterRecognizer:
                     self.detected_word = ""
                     self.last_letter = None
                     print("Cleared word")
-                elif key == 13:  # Enter
-                    if self.detected_word:
-                        print(f"Speaking: {self.detected_word}")
-                        self.tts.speak(self.detected_word)
-                        if not self.detected_word.endswith(" "):
-                            self.detected_word += " "
-                elif key == ord('t'):
-                    enabled = self.tts.toggle()
-                    status = "enabled" if enabled else "disabled"
-                    print(f"TTS {status}")
         
         cap.release()
         cv2.destroyAllWindows()
-        self.tts.close()
         
         if self.detected_word:
             print(f"\n✓ Final word: {self.detected_word}")
@@ -840,9 +700,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python asl_recognize.py                           # Default settings
-  python asl_recognize.py --camera 1                # Use camera 1
-  python asl_recognize.py --voice path/to/voice.onnx # Enable TTS
+  python asl_recognize.py                # Default settings
+  python asl_recognize.py --camera 1     # Use camera 1
         """
     )
     parser.add_argument(
@@ -857,16 +716,10 @@ Examples:
         default=0,
         help='Camera device ID (default: 0)'
     )
-    parser.add_argument(
-        '--voice',
-        type=str,
-        default=None,
-        help='Path to Piper voice model (.onnx file)'
-    )
     
     args = parser.parse_args()
     
-    recognizer = ASLLetterRecognizer(args.model_dir, args.voice)
+    recognizer = ASLLetterRecognizer(args.model_dir)
     recognizer.run_recognition(args.camera)
 
 
